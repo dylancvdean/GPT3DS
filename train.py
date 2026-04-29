@@ -120,6 +120,7 @@ class TrainConfig:
     hf_val_dataset: str | None = None
     hf_val_subset: str | None = None
     hf_val_split: str | None = None
+    hf_streaming: bool = True
     hf_text_field: str = "text"
     hf_conversations_field: str = "conversations"
     hf_system_prompt_field: str = "system_prompt"
@@ -130,6 +131,8 @@ class TrainConfig:
     train_buffer_tokens: int = 1_000_000
     refresh_buffer_tokens: int = 250_000
     sft_train_on_prompt: bool = False
+    sft_min_example_tokens: int = 0
+    sft_max_example_tokens: int | None = None
     hf_cache_dir: str = ".cache/huggingface"
     local_storage_budget_gb: float = 50.0
     vocab_size: int = 4096
@@ -387,9 +390,10 @@ def load_hf_split(
     subset: str | None,
     split: str,
     cache_dir: str | None,
+    streaming: bool,
 ) -> Any:
     load_dataset = require_hf_load_dataset()
-    kwargs: dict[str, Any] = {"split": split, "streaming": True}
+    kwargs: dict[str, Any] = {"split": split, "streaming": streaming}
     token = get_hf_token()
     if subset is not None:
         kwargs["name"] = subset
@@ -403,7 +407,35 @@ def load_hf_split(
 def maybe_shuffle_hf_dataset(dataset: Any, seed: int, buffer_size: int) -> Any:
     if buffer_size <= 0:
         return dataset
-    return dataset.shuffle(seed=seed, buffer_size=buffer_size)
+    if is_hf_iterable_dataset(dataset):
+        return dataset.shuffle(seed=seed, buffer_size=buffer_size)
+    return dataset.shuffle(seed=seed)
+
+
+def is_hf_iterable_dataset(dataset: Any) -> bool:
+    try:
+        from datasets import IterableDataset
+    except ImportError:
+        return False
+    return isinstance(dataset, IterableDataset)
+
+
+def dataset_take(dataset: Any, count: int) -> Any:
+    if count < 0:
+        raise ValueError("count must be non-negative")
+    if is_hf_iterable_dataset(dataset):
+        return dataset.take(count)
+    total = len(dataset)
+    return dataset.select(range(min(count, total)))
+
+
+def dataset_skip(dataset: Any, count: int) -> Any:
+    if count < 0:
+        raise ValueError("count must be non-negative")
+    if is_hf_iterable_dataset(dataset):
+        return dataset.skip(count)
+    total = len(dataset)
+    return dataset.select(range(min(count, total), total))
 
 
 def build_hf_train_and_val_datasets(train_config: TrainConfig) -> tuple[Any, Any]:
@@ -425,29 +457,59 @@ def build_hf_train_and_val_datasets(train_config: TrainConfig) -> tuple[Any, Any
     )
 
     if same_source:
-        val_dataset = maybe_shuffle_hf_dataset(
-            load_hf_split(val_dataset_name, val_subset, val_split, train_config.hf_cache_dir),
-            seed=train_config.seed,
-            buffer_size=train_config.hf_shuffle_buffer,
-        ).take(train_config.val_docs)
+        val_dataset = dataset_take(
+            maybe_shuffle_hf_dataset(
+                load_hf_split(
+                    val_dataset_name,
+                    val_subset,
+                    val_split,
+                    train_config.hf_cache_dir,
+                    train_config.hf_streaming,
+                ),
+                seed=train_config.seed,
+                buffer_size=train_config.hf_shuffle_buffer,
+            ),
+            train_config.val_docs,
+        )
 
-        train_dataset = maybe_shuffle_hf_dataset(
-            load_hf_split(train_dataset_name, train_subset, train_split, train_config.hf_cache_dir),
-            seed=train_config.seed,
-            buffer_size=train_config.hf_shuffle_buffer,
-        ).skip(train_config.val_docs)
+        train_dataset = dataset_skip(
+            maybe_shuffle_hf_dataset(
+                load_hf_split(
+                    train_dataset_name,
+                    train_subset,
+                    train_split,
+                    train_config.hf_cache_dir,
+                    train_config.hf_streaming,
+                ),
+                seed=train_config.seed,
+                buffer_size=train_config.hf_shuffle_buffer,
+            ),
+            train_config.val_docs,
+        )
     else:
-        val_dataset = load_hf_split(val_dataset_name, val_subset, val_split, train_config.hf_cache_dir)
-        val_dataset = val_dataset.take(train_config.val_docs)
+        val_dataset = load_hf_split(
+            val_dataset_name,
+            val_subset,
+            val_split,
+            train_config.hf_cache_dir,
+            train_config.hf_streaming,
+        )
+        val_dataset = dataset_take(val_dataset, train_config.val_docs)
 
         train_dataset = maybe_shuffle_hf_dataset(
-            load_hf_split(train_dataset_name, train_subset, train_split, train_config.hf_cache_dir),
+            load_hf_split(
+                train_dataset_name,
+                train_subset,
+                train_split,
+                train_config.hf_cache_dir,
+                train_config.hf_streaming,
+            ),
             seed=train_config.seed,
             buffer_size=train_config.hf_shuffle_buffer,
         )
 
     if train_config.train_docs_limit is not None:
-        train_dataset = train_dataset.take(train_config.train_docs_limit)
+        train_dataset = dataset_take(train_dataset, train_config.train_docs_limit)
 
     return train_dataset, val_dataset
 
@@ -462,11 +524,12 @@ def build_hf_tokenizer_dataset(train_config: TrainConfig) -> Any:
             train_config.hf_train_subset,
             train_config.hf_train_split,
             train_config.hf_cache_dir,
+            train_config.hf_streaming,
         ),
         seed=train_config.seed,
         buffer_size=train_config.hf_shuffle_buffer,
     )
-    return dataset.take(train_config.tokenizer_train_docs)
+    return dataset_take(dataset, train_config.tokenizer_train_docs)
 
 
 def extract_hf_text(example: Any, text_field: str) -> str | None:
@@ -497,6 +560,26 @@ def is_assistant_role(raw_role: Any) -> bool:
     return normalize_sft_role(raw_role) == ASSISTANT_LABEL
 
 
+def extract_message_role_and_text(turn: Any) -> tuple[Any, str | None]:
+    if not isinstance(turn, dict):
+        return None, None
+
+    role = turn.get("from")
+    if role is None:
+        role = turn.get("role")
+
+    value = turn.get("value")
+    if value is None:
+        value = turn.get("content")
+    if not isinstance(value, str):
+        return role, None
+
+    text = value.strip()
+    if not text:
+        return role, None
+    return role, text
+
+
 def format_sft_example_text(
     example: Any,
     conversations_field: str,
@@ -518,15 +601,10 @@ def format_sft_example_text(
         return None
 
     for turn in conversations:
-        if not isinstance(turn, dict):
+        role, text = extract_message_role_and_text(turn)
+        if text is None:
             continue
-        value = turn.get("value")
-        if not isinstance(value, str):
-            continue
-        text = value.strip()
-        if not text:
-            continue
-        label = normalize_sft_role(turn.get("from"))
+        label = normalize_sft_role(role)
         chunks.append(f"{label}: {text}\n\n")
 
     joined = "".join(chunks).strip()
@@ -597,17 +675,12 @@ def encode_hf_sft_example(
             append_encoded_piece(tokenizer, token_ids, loss_mask, "\n\n", False)
 
     for turn in conversations:
-        if not isinstance(turn, dict):
-            continue
-        value = turn.get("value")
-        if not isinstance(value, str):
-            continue
-        text = value.strip()
-        if not text:
+        role, text = extract_message_role_and_text(turn)
+        if text is None:
             continue
 
-        role_label = normalize_sft_role(turn.get("from"))
-        is_assistant = is_assistant_role(turn.get("from"))
+        role_label = normalize_sft_role(role)
+        is_assistant = is_assistant_role(role)
         train_on_value = is_assistant or train_on_prompt
 
         append_encoded_piece(tokenizer, token_ids, loss_mask, f"{role_label}: ", False)
@@ -623,6 +696,24 @@ def encode_hf_sft_example(
         return None
 
     return EncodedSequence(token_ids=token_ids, loss_mask=loss_mask)
+
+
+def filter_sft_example_by_length(
+    encoded: EncodedSequence | None,
+    min_example_tokens: int,
+    max_example_tokens: int | None,
+) -> EncodedSequence | None:
+    if encoded is None:
+        return None
+
+    input_tokens = len(encoded.token_ids) - 1
+    if input_tokens < 1:
+        return None
+    if input_tokens < min_example_tokens:
+        return None
+    if max_example_tokens is not None and input_tokens > max_example_tokens:
+        return None
+    return encoded
 
 
 def iter_hf_tokenizer_texts(train_config: TrainConfig) -> Iterator[str]:
@@ -713,6 +804,37 @@ class RandomSpanLoader:
             self.device,
             self.pad_id,
         )
+
+
+def encoded_sequence_to_padded_example_tensors(
+    encoded: EncodedSequence,
+    ctx_len: int,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if encoded.loss_mask is None:
+        raise RuntimeError("SFT example batching requires a loss mask")
+    if len(encoded.loss_mask) != len(encoded.token_ids):
+        raise RuntimeError("loss_mask length did not match token_ids length")
+
+    input_ids = encoded.token_ids[:-1]
+    target_ids = encoded.token_ids[1:]
+    target_mask = encoded.loss_mask[1:]
+
+    if len(input_ids) > ctx_len:
+        input_ids = input_ids[:ctx_len]
+        target_ids = target_ids[:ctx_len]
+        target_mask = target_mask[:ctx_len]
+
+    pad_tokens = ctx_len - len(input_ids)
+    x_values = input_ids + [pad_id] * pad_tokens
+    y_values = target_ids + [pad_id] * pad_tokens
+    y_mask_values = target_mask + [False] * pad_tokens
+
+    x = torch.tensor(x_values, dtype=torch.long)
+    y = torch.tensor(y_values, dtype=torch.long)
+    y_mask = torch.tensor(y_mask_values, dtype=torch.bool)
+    y = y.masked_fill(~y_mask, pad_id)
+    return x, y
 
 
 class RollingSpanLoader:
@@ -831,6 +953,127 @@ class RollingSpanLoader:
         return batch
 
 
+class RandomExampleLoader:
+    def __init__(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> None:
+        if inputs.ndim != 2 or targets.ndim != 2:
+            raise ValueError("inputs and targets must be 2D tensors")
+        if inputs.shape != targets.shape:
+            raise ValueError("inputs and targets must have the same shape")
+        if inputs.shape[0] < 1:
+            raise ValueError("example loader needs at least one example")
+
+        self.inputs = inputs
+        self.targets = targets
+        self.batch_size = batch_size
+        self.device = device
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        indices = torch.randint(0, self.inputs.size(0), (self.batch_size,), dtype=torch.long)
+        x_cpu = self.inputs[indices]
+        y_cpu = self.targets[indices]
+        return x_cpu.to(self.device, non_blocking=True), y_cpu.to(self.device, non_blocking=True)
+
+
+class RollingExampleLoader:
+    def __init__(
+        self,
+        example_iterable: Any,
+        encoder: Callable[[Any], EncodedSequence | None],
+        ctx_len: int,
+        batch_size: int,
+        device: torch.device,
+        pad_id: int,
+        buffer_tokens: int,
+        refresh_buffer_tokens: int,
+    ) -> None:
+        if refresh_buffer_tokens <= 0:
+            raise ValueError("refresh_buffer_tokens must be positive")
+
+        self.example_iterable = example_iterable
+        self.encoder = encoder
+        self.ctx_len = ctx_len
+        self.batch_size = batch_size
+        self.device = device
+        self.pad_id = pad_id
+        self.buffer_examples = max(batch_size, buffer_tokens // max(1, ctx_len))
+        self.refresh_examples = max(batch_size, refresh_buffer_tokens // max(1, ctx_len))
+
+        self.epoch = 0
+        if hasattr(self.example_iterable, "set_epoch"):
+            self.example_iterable.set_epoch(self.epoch)
+        self.iterator = iter(self.example_iterable)
+
+        self.inputs = torch.empty((0, ctx_len), dtype=torch.long)
+        self.targets = torch.empty((0, ctx_len), dtype=torch.long)
+        self.sampled_examples_since_refresh = 0
+        self.examples_loaded = 0
+
+        self._append_until(self.buffer_examples)
+
+    def _reset_iterator(self) -> None:
+        self.epoch += 1
+        if hasattr(self.example_iterable, "set_epoch"):
+            self.example_iterable.set_epoch(self.epoch)
+        self.iterator = iter(self.example_iterable)
+
+    def _next_encoded_sequence(self) -> EncodedSequence:
+        while True:
+            try:
+                example = next(self.iterator)
+            except StopIteration:
+                self._reset_iterator()
+                continue
+
+            encoded = self.encoder(example)
+            if encoded is None:
+                continue
+            return encoded
+
+    def _append_until(self, minimum_new_examples: int) -> None:
+        input_chunks: list[torch.Tensor] = []
+        target_chunks: list[torch.Tensor] = []
+
+        while len(input_chunks) < minimum_new_examples or self.inputs.size(0) + len(input_chunks) < self.batch_size:
+            encoded = self._next_encoded_sequence()
+            x, y = encoded_sequence_to_padded_example_tensors(encoded, self.ctx_len, self.pad_id)
+            input_chunks.append(x)
+            target_chunks.append(y)
+            self.examples_loaded += 1
+
+        new_inputs = torch.stack(input_chunks)
+        new_targets = torch.stack(target_chunks)
+
+        self.inputs = torch.cat((self.inputs, new_inputs))
+        self.targets = torch.cat((self.targets, new_targets))
+
+        if self.inputs.size(0) > self.buffer_examples:
+            self.inputs = self.inputs[-self.buffer_examples:]
+            self.targets = self.targets[-self.buffer_examples:]
+
+    def _refresh(self) -> None:
+        if self.inputs.size(0) > self.refresh_examples:
+            self.inputs = self.inputs[self.refresh_examples:]
+            self.targets = self.targets[self.refresh_examples:]
+        self._append_until(self.refresh_examples)
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.sampled_examples_since_refresh >= self.refresh_examples:
+            self._refresh()
+            self.sampled_examples_since_refresh = 0
+
+        indices = torch.randint(0, self.inputs.size(0), (self.batch_size,), dtype=torch.long)
+        x_cpu = self.inputs[indices]
+        y_cpu = self.targets[indices]
+        self.sampled_examples_since_refresh += self.batch_size
+        return x_cpu.to(self.device, non_blocking=True), y_cpu.to(self.device, non_blocking=True)
+
+
 def encode_iterable_to_tensors(
     examples: Iterable[Any],
     encoder: Callable[[Any], EncodedSequence | None],
@@ -867,6 +1110,31 @@ def encode_iterable_to_tensors(
         return tokens, None, docs_used
 
     return tokens, torch.cat(loss_mask_chunks), docs_used
+
+
+def encode_iterable_to_padded_examples(
+    examples: Iterable[Any],
+    encoder: Callable[[Any], EncodedSequence | None],
+    ctx_len: int,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    input_chunks: list[torch.Tensor] = []
+    target_chunks: list[torch.Tensor] = []
+    docs_used = 0
+
+    for example in examples:
+        encoded = encoder(example)
+        if encoded is None:
+            continue
+        x, y = encoded_sequence_to_padded_example_tensors(encoded, ctx_len, pad_id)
+        input_chunks.append(x)
+        target_chunks.append(y)
+        docs_used += 1
+
+    if not input_chunks:
+        raise RuntimeError("no usable SFT examples were found for the requested dataset split")
+
+    return torch.stack(input_chunks), torch.stack(target_chunks), docs_used
 
 
 class RMSNorm(nn.Module):
@@ -1114,7 +1382,7 @@ def cosine_lr(step: int, base_lr: float, warmup_steps: int, total_steps: int) ->
 @torch.no_grad()
 def evaluate(
     model: LoopedTransformerLm,
-    loader: RandomSpanLoader,
+    loader: Any,
     batches: int,
     autocast_dtype: torch.dtype,
 ) -> float:
@@ -1216,20 +1484,28 @@ def build_hf_loaders(
     tokenizer: Tokenizer,
     model_config: ModelConfig,
     device: torch.device,
-) -> tuple[RollingSpanLoader, RandomSpanLoader]:
+) -> tuple[Any, Any]:
     train_dataset, val_dataset = build_hf_train_and_val_datasets(train_config)
 
     uses_loss_mask = train_config.task == "sft"
     if uses_loss_mask:
-        encoder = lambda example: encode_hf_sft_example(
-            example,
-            tokenizer,
-            bos_id=model_config.bos_id,
-            eos_id=model_config.eos_id,
-            conversations_field=train_config.hf_conversations_field,
-            system_prompt_field=train_config.hf_system_prompt_field,
-            train_on_prompt=train_config.sft_train_on_prompt,
-        )
+        effective_max_tokens = train_config.sft_max_example_tokens
+
+        def encoder(example: Any) -> EncodedSequence | None:
+            raw = encode_hf_sft_example(
+                example,
+                tokenizer,
+                bos_id=model_config.bos_id,
+                eos_id=model_config.eos_id,
+                conversations_field=train_config.hf_conversations_field,
+                system_prompt_field=train_config.hf_system_prompt_field,
+                train_on_prompt=train_config.sft_train_on_prompt,
+            )
+            return filter_sft_example_by_length(
+                raw,
+                min_example_tokens=train_config.sft_min_example_tokens,
+                max_example_tokens=effective_max_tokens,
+            )
     else:
         encoder = lambda example: encode_hf_pretrain_example(
             example,
@@ -1237,48 +1513,87 @@ def build_hf_loaders(
             text_field=train_config.hf_text_field,
         )
 
-    val_tokens, val_loss_mask, val_docs_used = encode_iterable_to_tensors(
-        val_dataset,
-        encoder=encoder,
-        uses_loss_mask=uses_loss_mask,
-        ctx_len=model_config.ctx_len,
-    )
-
     if uses_loss_mask:
-        assert val_loss_mask is not None
-        supervised_targets = int(val_loss_mask[1:].sum().item()) if val_loss_mask.numel() > 1 else 0
+        val_inputs, val_targets, val_docs_used = encode_iterable_to_padded_examples(
+            val_dataset,
+            encoder=encoder,
+            ctx_len=model_config.ctx_len,
+            pad_id=model_config.pad_id,
+        )
+        supervised_targets = int((val_targets != model_config.pad_id).sum().item())
         print(f"val docs: {val_docs_used:,}")
-        print(f"val tokens: {val_tokens.numel():,} | supervised targets: {supervised_targets:,}")
+        print(
+            f"val examples: {val_inputs.size(0):,} | "
+            f"supervised targets: {supervised_targets:,}"
+        )
+
+        train_loader = RollingExampleLoader(
+            example_iterable=train_dataset,
+            encoder=encoder,
+            ctx_len=model_config.ctx_len,
+            batch_size=train_config.batch_size,
+            device=device,
+            pad_id=model_config.pad_id,
+            buffer_tokens=train_config.train_buffer_tokens,
+            refresh_buffer_tokens=train_config.refresh_buffer_tokens,
+        )
+        val_loader = RandomExampleLoader(
+            val_inputs,
+            val_targets,
+            train_config.batch_size,
+            device,
+        )
+
+        if effective_max_tokens is None:
+            print(f"sft overlength handling: truncate examples to ctx_len={model_config.ctx_len}")
+        else:
+            print(
+                f"sft example length filter: "
+                f"{train_config.sft_min_example_tokens}..{effective_max_tokens} tokens"
+            )
+        print(f"train example buffer: {train_loader.inputs.size(0):,}")
     else:
+        val_tokens, val_loss_mask, val_docs_used = encode_iterable_to_tensors(
+            val_dataset,
+            encoder=encoder,
+            uses_loss_mask=uses_loss_mask,
+            ctx_len=model_config.ctx_len,
+        )
         print(f"val docs: {val_docs_used:,}")
         print(f"val tokens: {val_tokens.numel():,}")
 
-    train_loader = RollingSpanLoader(
-        example_iterable=train_dataset,
-        encoder=encoder,
-        ctx_len=model_config.ctx_len,
-        batch_size=train_config.batch_size,
-        device=device,
-        pad_id=model_config.pad_id,
-        buffer_tokens=train_config.train_buffer_tokens,
-        refresh_buffer_tokens=train_config.refresh_buffer_tokens,
-        uses_loss_mask=uses_loss_mask,
-    )
-    val_loader = RandomSpanLoader(
-        val_tokens,
-        model_config.ctx_len,
-        train_config.batch_size,
-        device,
-        model_config.pad_id,
-        loss_mask=val_loss_mask,
-    )
+        train_loader = RollingSpanLoader(
+            example_iterable=train_dataset,
+            encoder=encoder,
+            ctx_len=model_config.ctx_len,
+            batch_size=train_config.batch_size,
+            device=device,
+            pad_id=model_config.pad_id,
+            buffer_tokens=train_config.train_buffer_tokens,
+            refresh_buffer_tokens=train_config.refresh_buffer_tokens,
+            uses_loss_mask=uses_loss_mask,
+        )
+        val_loader = RandomSpanLoader(
+            val_tokens,
+            model_config.ctx_len,
+            train_config.batch_size,
+            device,
+            model_config.pad_id,
+            loss_mask=val_loss_mask,
+        )
 
-    print(f"streaming train buffer tokens: {train_loader.tokens.numel():,}")
+        print(f"train token buffer: {train_loader.tokens.numel():,}")
     print(f"local storage budget: {train_config.local_storage_budget_gb:.1f} GB max")
-    print(
-        "dataset storage mode: streaming from Hugging Face "
-        "(full FineWeb/OpenHermes download avoided)"
-    )
+    if train_config.hf_streaming:
+        print(
+            "dataset storage mode: streaming from Hugging Face "
+            "(full dataset download avoided)"
+        )
+    else:
+        print(
+            "dataset storage mode: map-style Hugging Face download "
+            "(dataset cached locally before training)"
+        )
 
     return train_loader, val_loader
 
@@ -1299,6 +1614,7 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
     parser.add_argument("--hf_val_dataset", default=None)
     parser.add_argument("--hf_val_subset", default=None)
     parser.add_argument("--hf_val_split", default=None)
+    parser.add_argument("--hf_no_streaming", action="store_true")
     parser.add_argument("--hf_text_field", default="text")
     parser.add_argument("--hf_conversations_field", default="conversations")
     parser.add_argument("--hf_system_prompt_field", default="system_prompt")
@@ -1309,6 +1625,8 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
     parser.add_argument("--train_buffer_tokens", type=int, default=1_000_000)
     parser.add_argument("--refresh_buffer_tokens", type=int, default=250_000)
     parser.add_argument("--sft_train_on_prompt", action="store_true")
+    parser.add_argument("--sft_min_example_tokens", type=int, default=0)
+    parser.add_argument("--sft_max_example_tokens", type=int, default=0)
     parser.add_argument("--hf_cache_dir", default=".cache/huggingface")
     parser.add_argument("--local_storage_budget_gb", type=float, default=50.0)
 
@@ -1371,6 +1689,12 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
             parser.error("--train_buffer_tokens must be at least ctx_len + 2")
         if args.refresh_buffer_tokens < 1:
             parser.error("--refresh_buffer_tokens must be at least 1")
+    if args.sft_min_example_tokens < 0:
+        parser.error("--sft_min_example_tokens must be non-negative")
+    if args.sft_max_example_tokens < 0:
+        parser.error("--sft_max_example_tokens must be non-negative")
+    if args.sft_max_example_tokens > 0 and args.sft_min_example_tokens > args.sft_max_example_tokens:
+        parser.error("--sft_min_example_tokens cannot exceed --sft_max_example_tokens")
     if args.unique_blocks < 1:
         parser.error("--unique_blocks must be at least 1")
     if args.loops_per_pass < 1:
@@ -1396,6 +1720,7 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
         hf_val_dataset=args.hf_val_dataset,
         hf_val_subset=args.hf_val_subset,
         hf_val_split=args.hf_val_split,
+        hf_streaming=not args.hf_no_streaming,
         hf_text_field=args.hf_text_field,
         hf_conversations_field=args.hf_conversations_field,
         hf_system_prompt_field=args.hf_system_prompt_field,
@@ -1406,6 +1731,8 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
         train_buffer_tokens=args.train_buffer_tokens,
         refresh_buffer_tokens=args.refresh_buffer_tokens,
         sft_train_on_prompt=args.sft_train_on_prompt,
+        sft_min_example_tokens=args.sft_min_example_tokens,
+        sft_max_example_tokens=(args.sft_max_example_tokens or None),
         hf_cache_dir=args.hf_cache_dir,
         local_storage_budget_gb=args.local_storage_budget_gb,
         vocab_size=args.vocab_size,

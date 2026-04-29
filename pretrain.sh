@@ -18,7 +18,13 @@ exec python train.py \
   --unique_blocks 3 \
   --loops_per_pass 6 \
   --mlp_mult 4 \
-  --batch_size 16 \
-  --steps 20000 \
+  --batch_size 32 \
+  --steps 500000 \
+  --lr 3e-4 \
+  --warmup_steps 10000 \
+  --min_lr_ratio 0.1 \
+  --eval_every 5000 \
+  --save_every 25000 \
+  --sample_every 5000 \
   --dtype fp16 \
   "$@"

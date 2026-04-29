@@ -70,6 +70,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tokenizers import Tokenizer
+from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.models import BPE
 from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.processors import TemplateProcessing
@@ -141,6 +142,7 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 0.1
     warmup_steps: int = 1_000
+    min_lr_ratio: float = 0.0
     eval_every: int = 500
     eval_batches: int = 50
     save_every: int = 2_000
@@ -167,6 +169,7 @@ def ensure_parent_dir(path: str) -> None:
 def build_bpe_tokenizer() -> Tokenizer:
     tokenizer = Tokenizer(BPE(unk_token=UNK_TEXT))
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+    tokenizer.decoder = ByteLevelDecoder()
     return tokenizer
 
 
@@ -213,7 +216,11 @@ def train_bpe_tokenizer_from_iterator(
 
 
 def load_bpe_tokenizer(tokenizer_path: str) -> Tokenizer:
-    return Tokenizer.from_file(tokenizer_path)
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    # Older saved tokenizers may be missing the byte-level decoder, which causes
+    # decoded samples to show raw markers like "Ġ" and "Ċ" instead of spaces/newlines.
+    tokenizer.decoder = ByteLevelDecoder()
+    return tokenizer
 
 
 def special_id(tokenizer: Tokenizer, token_text: str) -> int:
@@ -1369,14 +1376,21 @@ def get_autocast_dtype(dtype: str) -> torch.dtype:
     raise ValueError("dtype must be fp16, bf16, or fp32")
 
 
-def cosine_lr(step: int, base_lr: float, warmup_steps: int, total_steps: int) -> float:
+def cosine_lr(
+    step: int,
+    base_lr: float,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_ratio: float,
+) -> float:
     if step < warmup_steps:
         return base_lr * float(step + 1) / float(max(1, warmup_steps))
 
     progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
     progress = min(max(progress, 0.0), 1.0)
-
-    return 0.5 * base_lr * (1.0 + math.cos(math.pi * progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    min_lr = base_lr * min_lr_ratio
+    return min_lr + (base_lr - min_lr) * cosine
 
 
 @torch.no_grad()
@@ -1650,6 +1664,7 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.0)
     parser.add_argument("--eval_every", type=int, default=500)
     parser.add_argument("--eval_batches", type=int, default=50)
     parser.add_argument("--save_every", type=int, default=2_000)
@@ -1695,6 +1710,8 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
         parser.error("--sft_max_example_tokens must be non-negative")
     if args.sft_max_example_tokens > 0 and args.sft_min_example_tokens > args.sft_max_example_tokens:
         parser.error("--sft_min_example_tokens cannot exceed --sft_max_example_tokens")
+    if not 0.0 <= args.min_lr_ratio <= 1.0:
+        parser.error("--min_lr_ratio must be between 0.0 and 1.0")
     if args.unique_blocks < 1:
         parser.error("--unique_blocks must be at least 1")
     if args.loops_per_pass < 1:
@@ -1741,6 +1758,7 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
         lr=args.lr,
         weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps,
+        min_lr_ratio=args.min_lr_ratio,
         eval_every=args.eval_every,
         eval_batches=args.eval_batches,
         save_every=args.save_every,
@@ -1884,8 +1902,13 @@ def main() -> None:
     model.train()
 
     for step in range(train_config.steps):
-        lr = cosine_lr(step, train_config.lr, train_config.warmup_steps, train_config.steps)
-
+        lr = cosine_lr(
+            step,
+            train_config.lr,
+            train_config.warmup_steps,
+            train_config.steps,
+            train_config.min_lr_ratio,
+        )
         for group in optimizer.param_groups:
             group["lr"] = lr
 

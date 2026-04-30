@@ -1032,6 +1032,47 @@ class RandomExampleLoader:
         return x_cpu.to(self.device, non_blocking=True), y_cpu.to(self.device, non_blocking=True)
 
 
+class InterleavedRandomExampleLoader:
+    def __init__(
+        self,
+        sources: list[tuple[torch.Tensor, torch.Tensor]],
+        batch_size: int,
+        device: torch.device,
+    ) -> None:
+        if not sources:
+            raise ValueError("interleaved loader needs at least one source")
+        for inputs, targets in sources:
+            if inputs.ndim != 2 or targets.ndim != 2:
+                raise ValueError("inputs and targets must be 2D tensors")
+            if inputs.shape != targets.shape:
+                raise ValueError("inputs and targets must have the same shape")
+            if inputs.shape[0] < 1:
+                raise ValueError("each source needs at least one example")
+
+        self.sources = sources
+        self.batch_size = batch_size
+        self.device = device
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        source_ids = torch.randint(0, len(self.sources), (self.batch_size,), dtype=torch.long)
+        x_parts: list[torch.Tensor] = []
+        y_parts: list[torch.Tensor] = []
+        for source_id, (inputs, targets) in enumerate(self.sources):
+            count = int((source_ids == source_id).sum().item())
+            if count == 0:
+                continue
+            indices = torch.randint(0, inputs.size(0), (count,), dtype=torch.long)
+            x_parts.append(inputs[indices])
+            y_parts.append(targets[indices])
+
+        x_cpu = torch.cat(x_parts, dim=0)
+        y_cpu = torch.cat(y_parts, dim=0)
+        order = torch.randperm(x_cpu.size(0))
+        x_cpu = x_cpu[order]
+        y_cpu = y_cpu[order]
+        return x_cpu.to(self.device, non_blocking=True), y_cpu.to(self.device, non_blocking=True)
+
+
 class RollingExampleLoader:
     def __init__(
         self,
@@ -1205,6 +1246,14 @@ def load_jsonl_examples(path: str) -> list[dict[str, Any]]:
     return examples
 
 
+def split_jsonl_paths(paths: str) -> list[str]:
+    values = [path.strip() for path in paths.split(",")]
+    values = [path for path in values if path]
+    if not values:
+        raise RuntimeError("no JSONL paths were provided")
+    return values
+
+
 def build_jsonl_sft_loaders(
     train_config: TrainConfig,
     tokenizer: Tokenizer,
@@ -1231,31 +1280,47 @@ def build_jsonl_sft_loaders(
             max_example_tokens=train_config.sft_max_example_tokens,
         )
 
-    train_examples = load_jsonl_examples(train_config.train_jsonl)
-    val_examples = load_jsonl_examples(train_config.val_jsonl)
+    def encode_paths(paths: list[str], split_name: str) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], int, int]:
+        sources: list[tuple[torch.Tensor, torch.Tensor]] = []
+        total_docs_used = 0
+        total_targets = 0
+        for path in paths:
+            examples = load_jsonl_examples(path)
+            inputs, targets, docs_used = encode_iterable_to_padded_examples(
+                examples,
+                encoder=encoder,
+                ctx_len=model_config.ctx_len,
+                pad_id=model_config.pad_id,
+            )
+            target_count = int((targets != model_config.pad_id).sum().item())
+            print(f"{split_name} source: {path} | examples {docs_used:,} | supervised targets {target_count:,}")
+            sources.append((inputs, targets))
+            total_docs_used += docs_used
+            total_targets += target_count
+        return sources, total_docs_used, total_targets
 
-    train_inputs, train_targets, train_docs_used = encode_iterable_to_padded_examples(
-        train_examples,
-        encoder=encoder,
-        ctx_len=model_config.ctx_len,
-        pad_id=model_config.pad_id,
-    )
-    val_inputs, val_targets, val_docs_used = encode_iterable_to_padded_examples(
-        val_examples,
-        encoder=encoder,
-        ctx_len=model_config.ctx_len,
-        pad_id=model_config.pad_id,
-    )
+    train_paths = split_jsonl_paths(train_config.train_jsonl)
+    val_paths = split_jsonl_paths(train_config.val_jsonl)
+
+    train_sources, train_docs_used, train_target_count = encode_paths(train_paths, "train")
+    val_sources, val_docs_used, val_target_count = encode_paths(val_paths, "val")
 
     print(f"train examples: {train_docs_used:,}")
     print(f"val examples:   {val_docs_used:,}")
-    print(f"train supervised targets: {int((train_targets != model_config.pad_id).sum().item()):,}")
-    print(f"val supervised targets:   {int((val_targets != model_config.pad_id).sum().item()):,}")
+    print(f"train supervised targets: {train_target_count:,}")
+    print(f"val supervised targets:   {val_target_count:,}")
 
-    return (
-        RandomExampleLoader(train_inputs, train_targets, train_config.batch_size, device),
-        RandomExampleLoader(val_inputs, val_targets, train_config.batch_size, device),
+    train_loader = (
+        InterleavedRandomExampleLoader(train_sources, train_config.batch_size, device)
+        if len(train_sources) > 1
+        else RandomExampleLoader(train_sources[0][0], train_sources[0][1], train_config.batch_size, device)
     )
+    val_loader = (
+        InterleavedRandomExampleLoader(val_sources, train_config.batch_size, device)
+        if len(val_sources) > 1
+        else RandomExampleLoader(val_sources[0][0], val_sources[0][1], train_config.batch_size, device)
+    )
+    return train_loader, val_loader
 
 
 class RMSNorm(nn.Module):
@@ -1612,11 +1677,7 @@ def sample_text(
     max_new_tokens: int,
     device: torch.device,
 ) -> str:
-    encoded = tokenizer.encode(prompt)
-    ids = encoded.ids
-
-    if len(ids) == 0:
-        ids = [model.config.bos_id]
+    ids = [model.config.bos_id] + encode_text_without_specials(tokenizer, prompt)
 
     idx = torch.tensor([ids], dtype=torch.long, device=device)
 

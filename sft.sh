@@ -6,13 +6,13 @@ cd "$(dirname "$0")"
 exec python train.py \
   --data_source jsonl \
   --task sft \
-  --train_jsonl data/smoltalk_pair128_train.jsonl \
+  --train_jsonl data/smoltalk_pair128_train.jsonl,data/synth_openrouter_pair128.jsonl \
   --val_jsonl data/smoltalk_pair128_val.jsonl \
   --hf_conversations_field messages \
   --tokenizer tokenizer_qwends.json \
   --sft_chat_template compact \
   --sft_tokenizer_out tokenizer_qwends_sft.json \
-  --init_checkpoint ckpt_fineweb.best.pt \
+  --init_checkpoint ckpt_fineweb.pt \
   --out ckpt_smoltalk_sft.pt \
   --ctx_len 128 \
   --d_model 512 \
@@ -22,5 +22,7 @@ exec python train.py \
   --mlp_mult 4 \
   --batch_size 8 \
   --steps 5000 \
+  --sample_prompt "<u>Tell me a joke.<a>" \
+  --sample_tokens 80 \
   --dtype fp16 \
   "$@"

@@ -11,6 +11,7 @@ __pycache__/
 
 .codex
 AGENTS.md
+build.sh
 
 3ds/build/
 3ds/GPT3DS.3dsx

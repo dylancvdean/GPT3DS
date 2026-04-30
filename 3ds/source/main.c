@@ -59,6 +59,12 @@
 #define MAX_RESPONSE_LEN 1024
 #define MAX_HISTORY      16
 
+/* SFT chat-template special token IDs (added_tokens in tokenizer_qwends_sft.json,
+ * not present in the BPE vocab — injected directly by id). */
+#define TOK_USER_ID       4096
+#define TOK_ASSISTANT_ID  4097
+#define TOK_LONG_ID       4098
+
 typedef struct {
     char user[MAX_PROMPT_LEN];
     char bot[MAX_RESPONSE_LEN];
@@ -121,7 +127,6 @@ static struct {
 /* ── System info ───────────────────────────────────────── */
 static u8  sys_battery_level = 0;   /* 0-5 */
 static u8  sys_charging = 0;
-static u8  sys_wifi = 0;            /* 0-3 */
 static u32 sys_app_mem_used = 0;
 static u32 sys_app_mem_total = 0;
 static u32 sys_all_mem_used = 0;
@@ -136,7 +141,6 @@ static void poll_system_info(void) {
 
     PTMU_GetBatteryLevel(&sys_battery_level);
     PTMU_GetBatteryChargeState(&sys_charging);
-    sys_wifi = osGetWifiStrength();
     sys_app_mem_used  = osGetMemRegionUsed(MEMREGION_APPLICATION);
     sys_app_mem_total = osGetMemRegionSize(MEMREGION_APPLICATION);
     sys_all_mem_used  = osGetMemRegionUsed(MEMREGION_ALL);
@@ -270,7 +274,7 @@ static void draw_top(float eye) {
     /* ── Footer ─────────────────────────────────── */
     C2D_DrawRectSolid(d_ui, TOP_H - FOOTER_H, 0.1f, TOP_W, FOOTER_H, COL_FOOTER);
     dt(10.0f + d_ui, TOP_H - FOOTER_H + 3.0f, 0.15f,
-       SMALL_SCALE, COL_TEXT_DIM, "[A] Chat");
+       SMALL_SCALE, COL_TEXT_DIM, "[A] Chat  [X] Reset");
     dt(TOP_W - 95.0f + d_ui, TOP_H - FOOTER_H + 3.0f, 0.15f,
        SMALL_SCALE, COL_TEXT_DIM, "[START] Exit");
 }
@@ -350,22 +354,7 @@ static void draw_bot_screen(void) {
     }
     y += 10;
 
-    /* WiFi */
-    dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "WiFi:");
-    {
-        /* Draw signal bars */
-        float bx = c2;
-        for (int i = 0; i < 4; i++) {
-            float bar_h = 3.0f + i * 2.0f;
-            float by = y + 9.0f - bar_h;
-            u32 col = (i < (int)sys_wifi)
-                ? COL_DBG_VAL
-                : C2D_Color32(40, 40, 60, 255);
-            C2D_DrawRectSolid(bx + i * 6.0f, by, 0.1f, 4, bar_h, col);
-        }
-        dtf(c2 + 30, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d/3", sys_wifi);
-    }
-    y += 12;
+    y += 2;
 
     /* ── Model ─────────────────────────────────── */
     dt(8, y, 0.1f, SMALL_SCALE, COL_DBG_SECT, "Model");
@@ -448,7 +437,7 @@ static void draw_bot_screen(void) {
     y = BOT_H - 14.0f;
     C2D_DrawRectSolid(0, y - 4, 0.1f, BOT_W, BOT_H - y + 4, COL_DBG_HEADER);
     dt(8, y, 0.1f, SMALL_SCALE, COL_TEXT_DIM,
-       "[A] Chat  [DPad] Config  [START] Exit");
+       "[A] Chat  [X] Reset  [DPad] Config  [START] Exit");
 }
 
 /* ── Render one complete frame ─────────────────────────── */
@@ -618,6 +607,22 @@ int main(int argc, char* argv[]) {
         if (kDown & KEY_DRIGHT) hp_adjust(1);
         if (kDown & KEY_DLEFT)  hp_adjust(-1);
 
+        /* X: reset chat — clears history and KV cache */
+        if (kDown & KEY_X) {
+            history_count = 0;
+            live_active = 0;
+            live_user[0] = '\0';
+            live_bot[0] = '\0';
+            chat_scroll_off = 0.0f;
+            model.cache_len = 0;
+            dbg.status = "Ready";
+            dbg.tokens_generated = 0;
+            dbg.max_tokens = 0;
+            dbg.cache_len = 0;
+            dbg.prompt_tokens = 0;
+            dbg.tokens_per_sec = 0.0f;
+        }
+
         if (kDown & KEY_A) {
             /* Software keyboard */
             SwkbdState swkbd;
@@ -636,17 +641,35 @@ int main(int argc, char* argv[]) {
             if (button == SWKBD_BUTTON_RIGHT && input_text[0] != '\0') {
                 model_seed_rng((uint32_t)svcGetSystemTick());
 
-                /* Encode prompt */
+                /* Encode the new turn. KV cache persists across turns:
+                 *   first turn:   <bos> <u> {user_text} <a>
+                 *   later turns:        <u> {user_text} <a>   (cache holds prior) */
                 int tokens[MODEL_CTX_LEN];
-                int n_tokens = tokenizer_encode(tokenizer, input_text,
-                                                tokens, MODEL_CTX_LEN, 1);
-                if (n_tokens <= 0) {
+                int n_tokens = 0;
+                if (model.cache_len == 0) {
+                    tokens[n_tokens++] = tokenizer_bos_id(tokenizer);
+                }
+                tokens[n_tokens++] = TOK_USER_ID;
+
+                int user_tokens[MODEL_CTX_LEN];
+                int budget = MODEL_CTX_LEN - model.cache_len - n_tokens - 1;
+                if (budget <= 0) {
+                    dbg.status = "Context full: press X to reset";
+                    render_frame();
+                    continue;
+                }
+                int n_user = tokenizer_encode(tokenizer, input_text,
+                                              user_tokens, budget, 0);
+                if (n_user <= 0) {
                     dbg.status = "Error: no tokens";
                     render_frame();
                     continue;
                 }
-                if (n_tokens >= MODEL_CTX_LEN) {
-                    dbg.status = "Error: prompt too long";
+                for (int i = 0; i < n_user; i++) tokens[n_tokens++] = user_tokens[i];
+                tokens[n_tokens++] = TOK_ASSISTANT_ID;
+
+                if (model.cache_len + n_tokens >= MODEL_CTX_LEN) {
+                    dbg.status = "Context full: press X to reset";
                     render_frame();
                     continue;
                 }
@@ -661,16 +684,15 @@ int main(int argc, char* argv[]) {
                 dbg.status = "Prefilling";
                 dbg.prompt_tokens = n_tokens;
                 dbg.tokens_generated = 0;
-                int ctx_remaining = MODEL_CTX_LEN - n_tokens;
+                int ctx_remaining = MODEL_CTX_LEN - model.cache_len - n_tokens;
                 int max_new = (hp_max_tokens > 0 && hp_max_tokens < ctx_remaining)
                             ? hp_max_tokens : ctx_remaining;
                 dbg.max_tokens = max_new;
-                dbg.cache_len = 0;
+                dbg.cache_len = model.cache_len;
                 dbg.tokens_per_sec = 0.0f;
                 render_frame();
 
-                /* Prefill */
-                model.cache_len = 0;
+                /* Prefill (cache_len preserved across turns) */
                 model_forward(&model, tokens, n_tokens, generation_logits, 1);
                 int next_token = model_sample_logits(generation_logits,
                                                      hp_temperature,

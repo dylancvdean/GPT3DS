@@ -1,1 +1,2 @@
 ckpt_fineweb.pt filter=lfs diff=lfs merge=lfs -text
+ckpt_smoltalk_sft.best.pt filter=lfs diff=lfs merge=lfs -text

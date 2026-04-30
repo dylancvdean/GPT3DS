@@ -35,8 +35,8 @@ INCLUDES	:=	source romfs
 GRAPHICS	:=	
 ROMFS		:=	romfs
 MAKEROM		?=	$(firstword $(wildcard $(DEVKITPRO)/tools/bin/makerom tools/makerom /tmp/makerom-v0.18.4/makerom) makerom)
-CHECKPOINT	?=	$(TOPDIR)/../ckpt_fineweb.pt
-TOKENIZER_CBIN	?=	$(TOPDIR)/../tokenizer_qwends.cbin
+CHECKPOINT	?=	$(TOPDIR)/../ckpt_smoltalk_sft.best.pt
+TOKENIZER_JSON	?=	$(TOPDIR)/../tokenizer_qwends_sft.json
 PYTHON		?=	$(firstword $(wildcard $(TOPDIR)/../.venv/bin/python) python3)
 
 APP_TITLE	:=	GPT3DS
@@ -147,9 +147,9 @@ $(ROMFS)/model_weights.bin $(ROMFS)/model_desc.h &: export_3ds.py $(CHECKPOINT)
 	@echo export model from $(notdir $(CHECKPOINT)) ...
 	@$(PYTHON) export_3ds.py --checkpoint $(CHECKPOINT) --out_dir $(ROMFS)
 
-$(ROMFS)/tokenizer_qwends.cbin: $(TOKENIZER_CBIN)
-	@echo update $(notdir $@) ...
-	@cp $< $@
+$(ROMFS)/tokenizer_qwends.cbin: export_tokenizer.py $(TOKENIZER_JSON)
+	@echo export tokenizer from $(notdir $(TOKENIZER_JSON)) ...
+	@$(PYTHON) export_tokenizer.py --tokenizer_json $(TOKENIZER_JSON) --out $@
 
 $(BUILD):
 	@[ -d $@ ] || mkdir -p $@

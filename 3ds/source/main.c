@@ -290,7 +290,7 @@ static void draw_bot_screen(void) {
 
     /* ── System ────────────────────────────────── */
     dt(8, y, 0.1f, SMALL_SCALE, COL_DBG_SECT, "System");
-    y += 13;
+    y += 11;
 
     /* Battery: bar + level */
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Battery:");
@@ -312,7 +312,7 @@ static void draw_bot_screen(void) {
             dtf(bx + bw + 8, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d/5",
                 sys_battery_level);
     }
-    y += 11;
+    y += 10;
 
     /* App memory: bar + values */
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "App mem:");
@@ -330,7 +330,7 @@ static void draw_bot_screen(void) {
             "%luM/%luM", (unsigned long)(sys_app_mem_used / (1024*1024)),
             (unsigned long)(sys_app_mem_total / (1024*1024)));
     }
-    y += 11;
+    y += 10;
 
     /* System memory */
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Sys mem:");
@@ -348,7 +348,7 @@ static void draw_bot_screen(void) {
             "%luM/%luM", (unsigned long)(sys_all_mem_used / (1024*1024)),
             (unsigned long)(sys_all_mem_total / (1024*1024)));
     }
-    y += 11;
+    y += 10;
 
     /* WiFi */
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "WiFi:");
@@ -365,47 +365,45 @@ static void draw_bot_screen(void) {
         }
         dtf(c2 + 30, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d/3", sys_wifi);
     }
-    y += 14;
+    y += 12;
 
     /* ── Model ─────────────────────────────────── */
     dt(8, y, 0.1f, SMALL_SCALE, COL_DBG_SECT, "Model");
-    y += 13;
+    y += 11;
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Params:");
     dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d", MODEL_TOTAL_PARAMS);
-    y += 11;
+    y += 10;
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Arch:");
     dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%dx%d loops, int8",
         MODEL_UNIQUE_BLOCKS, MODEL_LOOPS_PER_PASS);
-    y += 11;
+    y += 10;
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Vocab/Ctx:");
     dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d / %d",
         MODEL_VOCAB_SIZE, MODEL_CTX_LEN);
-    y += 14;
+    y += 12;
 
     /* ── Generation ────────────────────────────── */
     dt(8, y, 0.1f, SMALL_SCALE, COL_DBG_SECT, "Generation");
-    y += 13;
+    y += 11;
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Status:");
     u32 sc = COL_DBG_VAL;
     if (strcmp(dbg.status, "Generating") == 0) sc = COL_DBG_WARN;
     else if (strcmp(dbg.status, "Prefilling") == 0) sc = COL_DBG_WARN;
     else if (strstr(dbg.status, "Error") != NULL) sc = COL_DBG_ERR;
     dt(c2, y, 0.1f, SMALL_SCALE, sc, dbg.status);
-    y += 11;
+    if (dbg.tokens_per_sec > 0.0f) {
+        dtf(c2 + 60, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%.2f tok/s",
+            dbg.tokens_per_sec);
+    }
+    y += 10;
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Tokens:");
     dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d/%d gen  %d prompt",
         dbg.tokens_generated, dbg.max_tokens, dbg.prompt_tokens);
-    y += 11;
+    y += 10;
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Cache:");
     dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d / %d",
         dbg.cache_len, MODEL_CTX_LEN);
-    y += 11;
-    if (dbg.tokens_per_sec > 0.0f) {
-        dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Speed:");
-        dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%.2f tok/s",
-            dbg.tokens_per_sec);
-    }
-    y += 14;
+    y += 12;
 
     /* ── Progress bar (during generation) ──────── */
     if (dbg.max_tokens > 0 && strcmp(dbg.status, "Generating") == 0) {
@@ -416,12 +414,12 @@ static void draw_bot_screen(void) {
         C2D_DrawRectSolid(16, y, 0.12f, bar_w * fill, 8, COL_ACCENT);
         dtf(16 + bar_w + 4, y - 1, 0.1f, SMALL_SCALE, COL_TEXT_DIM,
             "%d%%", (int)(fill * 100));
-        y += 14;
+        y += 12;
     }
 
     /* ── Hyperparameters ───────────────────────── */
     dt(8, y, 0.1f, SMALL_SCALE, COL_DBG_SECT, "Config");
-    y += 13;
+    y += 11;
     for (int p = 0; p < HP_COUNT; p++) {
         u32 kc = (p == hp_sel) ? COL_ACCENT : COL_DBG_KEY;
         u32 vc = (p == hp_sel) ? COL_TEXT   : COL_DBG_VAL;
@@ -443,15 +441,14 @@ static void draw_bot_screen(void) {
                 dtf(c2, y, 0.1f, SMALL_SCALE, vc, "%d", hp_max_tokens);
             break;
         }
-        y += 11;
+        y += 10;
     }
 
     /* ── Controls ──────────────────────────────── */
-    y = BOT_H - 26.0f;
+    y = BOT_H - 14.0f;
     C2D_DrawRectSolid(0, y - 4, 0.1f, BOT_W, BOT_H - y + 4, COL_DBG_HEADER);
-    dt(8, y, 0.1f, SMALL_SCALE, COL_TEXT_DIM, "[A] Chat  [START] Exit");
-    dt(8, y + 11, 0.1f, SMALL_SCALE, COL_TEXT_DIM,
-       "[D-pad] Select/adjust config");
+    dt(8, y, 0.1f, SMALL_SCALE, COL_TEXT_DIM,
+       "[A] Chat  [DPad] Config  [START] Exit");
 }
 
 /* ── Render one complete frame ─────────────────────────── */

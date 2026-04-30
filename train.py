@@ -85,6 +85,9 @@ UNK_TEXT = "<unk>"
 SYSTEM_LABEL = "System"
 USER_LABEL = "User"
 ASSISTANT_LABEL = "Assistant"
+USER_CHAT_TOKEN = "<u>"
+ASSISTANT_CHAT_TOKEN = "<a>"
+LONG_CHAT_TOKEN = "<long>"
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,8 @@ class TrainConfig:
     task: str
     train_text: str | None = None
     val_text: str | None = None
+    train_jsonl: str | None = None
+    val_jsonl: str | None = None
     hf_train_dataset: str | None = None
     hf_train_subset: str | None = None
     hf_train_split: str = "train"
@@ -134,6 +139,8 @@ class TrainConfig:
     sft_train_on_prompt: bool = False
     sft_min_example_tokens: int = 0
     sft_max_example_tokens: int | None = None
+    sft_chat_template: str = "labels"
+    sft_tokenizer_out: str | None = None
     hf_cache_dir: str = ".cache/huggingface"
     local_storage_budget_gb: float = 50.0
     vocab_size: int = 4096
@@ -221,6 +228,10 @@ def load_bpe_tokenizer(tokenizer_path: str) -> Tokenizer:
     # decoded samples to show raw markers like "Ġ" and "Ċ" instead of spaces/newlines.
     tokenizer.decoder = ByteLevelDecoder()
     return tokenizer
+
+
+def add_chat_special_tokens(tokenizer: Tokenizer) -> int:
+    return tokenizer.add_special_tokens([USER_CHAT_TOKEN, ASSISTANT_CHAT_TOKEN, LONG_CHAT_TOKEN])
 
 
 def special_id(tokenizer: Tokenizer, token_text: str) -> int:
@@ -661,6 +672,7 @@ def encode_hf_sft_example(
     conversations_field: str,
     system_prompt_field: str,
     train_on_prompt: bool,
+    chat_template: str,
 ) -> EncodedSequence | None:
     if not isinstance(example, dict):
         return None
@@ -672,6 +684,39 @@ def encode_hf_sft_example(
     token_ids: list[int] = [bos_id]
     loss_mask: list[bool] = [False]
     assistant_tokens = 0
+
+    if chat_template == "compact":
+        user_id = special_id(tokenizer, USER_CHAT_TOKEN)
+        assistant_id = special_id(tokenizer, ASSISTANT_CHAT_TOKEN)
+
+        for turn in conversations:
+            role, text = extract_message_role_and_text(turn)
+            if text is None:
+                continue
+
+            is_assistant = is_assistant_role(role)
+            marker_id = assistant_id if is_assistant else user_id
+            train_on_value = is_assistant or train_on_prompt
+
+            token_ids.append(marker_id)
+            loss_mask.append(False)
+            assistant_tokens += append_encoded_piece(
+                tokenizer,
+                token_ids,
+                loss_mask,
+                text,
+                train_on_value,
+            )
+
+        token_ids.append(eos_id)
+        loss_mask.append(assistant_tokens > 0)
+
+        if len(token_ids) < 2:
+            return None
+        if not train_on_prompt and assistant_tokens == 0:
+            return None
+
+        return EncodedSequence(token_ids=token_ids, loss_mask=loss_mask)
 
     system_prompt = example.get(system_prompt_field)
     if isinstance(system_prompt, str):
@@ -1144,6 +1189,75 @@ def encode_iterable_to_padded_examples(
     return torch.stack(input_chunks), torch.stack(target_chunks), docs_used
 
 
+def load_jsonl_examples(path: str) -> list[dict[str, Any]]:
+    examples: list[dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            value = json.loads(stripped)
+            if not isinstance(value, dict):
+                raise RuntimeError(f"{path}:{line_number} was not a JSON object")
+            examples.append(value)
+    if not examples:
+        raise RuntimeError(f"{path} did not contain any usable examples")
+    return examples
+
+
+def build_jsonl_sft_loaders(
+    train_config: TrainConfig,
+    tokenizer: Tokenizer,
+    model_config: ModelConfig,
+    device: torch.device,
+) -> tuple[RandomExampleLoader, RandomExampleLoader]:
+    if train_config.train_jsonl is None or train_config.val_jsonl is None:
+        raise RuntimeError("--data_source jsonl requires --train_jsonl and --val_jsonl")
+
+    def encoder(example: Any) -> EncodedSequence | None:
+        raw = encode_hf_sft_example(
+            example,
+            tokenizer,
+            bos_id=model_config.bos_id,
+            eos_id=model_config.eos_id,
+            conversations_field=train_config.hf_conversations_field,
+            system_prompt_field=train_config.hf_system_prompt_field,
+            train_on_prompt=train_config.sft_train_on_prompt,
+            chat_template=train_config.sft_chat_template,
+        )
+        return filter_sft_example_by_length(
+            raw,
+            min_example_tokens=train_config.sft_min_example_tokens,
+            max_example_tokens=train_config.sft_max_example_tokens,
+        )
+
+    train_examples = load_jsonl_examples(train_config.train_jsonl)
+    val_examples = load_jsonl_examples(train_config.val_jsonl)
+
+    train_inputs, train_targets, train_docs_used = encode_iterable_to_padded_examples(
+        train_examples,
+        encoder=encoder,
+        ctx_len=model_config.ctx_len,
+        pad_id=model_config.pad_id,
+    )
+    val_inputs, val_targets, val_docs_used = encode_iterable_to_padded_examples(
+        val_examples,
+        encoder=encoder,
+        ctx_len=model_config.ctx_len,
+        pad_id=model_config.pad_id,
+    )
+
+    print(f"train examples: {train_docs_used:,}")
+    print(f"val examples:   {val_docs_used:,}")
+    print(f"train supervised targets: {int((train_targets != model_config.pad_id).sum().item()):,}")
+    print(f"val supervised targets:   {int((val_targets != model_config.pad_id).sum().item()):,}")
+
+    return (
+        RandomExampleLoader(train_inputs, train_targets, train_config.batch_size, device),
+        RandomExampleLoader(val_inputs, val_targets, train_config.batch_size, device),
+    )
+
+
 class RMSNorm(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-5) -> None:
         super().__init__()
@@ -1454,7 +1568,31 @@ def load_init_checkpoint(path: str, model: LoopedTransformerLm) -> tuple[int | N
     if not isinstance(model_state, dict):
         raise RuntimeError(f"checkpoint {path!r} does not contain `model_state`")
 
-    model.load_state_dict(model_state)
+    current_state = model.state_dict()
+    resized_state: dict[str, torch.Tensor] = {}
+    for key, current_value in current_state.items():
+        loaded_value = model_state.get(key)
+        if not isinstance(loaded_value, torch.Tensor):
+            resized_state[key] = current_value
+            continue
+        if loaded_value.shape == current_value.shape:
+            resized_state[key] = loaded_value
+            continue
+        if key in {"token_emb.weight", "lm_head_bias"} and loaded_value.shape[0] <= current_value.shape[0]:
+            merged_value = current_value.clone()
+            merged_value[:loaded_value.shape[0]] = loaded_value
+            resized_state[key] = merged_value
+            print(
+                f"resized checkpoint tensor {key}: "
+                f"{tuple(loaded_value.shape)} -> {tuple(current_value.shape)}"
+            )
+            continue
+        raise RuntimeError(
+            f"checkpoint tensor {key!r} had shape {tuple(loaded_value.shape)}, "
+            f"expected {tuple(current_value.shape)}"
+        )
+
+    model.load_state_dict(resized_state)
 
     step = checkpoint.get("step")
     if not isinstance(step, int):
@@ -1514,6 +1652,7 @@ def build_hf_loaders(
                 conversations_field=train_config.hf_conversations_field,
                 system_prompt_field=train_config.hf_system_prompt_field,
                 train_on_prompt=train_config.sft_train_on_prompt,
+                chat_template=train_config.sft_chat_template,
             )
             return filter_sft_example_by_length(
                 raw,
@@ -1615,11 +1754,13 @@ def build_hf_loaders(
 def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data_source", choices=["text", "huggingface"], default="text")
+    parser.add_argument("--data_source", choices=["text", "huggingface", "jsonl"], default="text")
     parser.add_argument("--task", choices=["pretrain", "sft"], default="pretrain")
 
     parser.add_argument("--train_text", default=None)
     parser.add_argument("--val_text", default=None)
+    parser.add_argument("--train_jsonl", default=None)
+    parser.add_argument("--val_jsonl", default=None)
     parser.add_argument("--out", required=True)
 
     parser.add_argument("--hf_train_dataset", default=None)
@@ -1641,6 +1782,8 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
     parser.add_argument("--sft_train_on_prompt", action="store_true")
     parser.add_argument("--sft_min_example_tokens", type=int, default=0)
     parser.add_argument("--sft_max_example_tokens", type=int, default=0)
+    parser.add_argument("--sft_chat_template", choices=["labels", "compact"], default="labels")
+    parser.add_argument("--sft_tokenizer_out", default=None)
     parser.add_argument("--hf_cache_dir", default=".cache/huggingface")
     parser.add_argument("--local_storage_budget_gb", type=float, default=50.0)
 
@@ -1680,6 +1823,8 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
 
     args.train_text = normalize_optional_string(args.train_text)
     args.val_text = normalize_optional_string(args.val_text)
+    args.train_jsonl = normalize_optional_string(args.train_jsonl)
+    args.val_jsonl = normalize_optional_string(args.val_jsonl)
     args.hf_train_dataset = normalize_optional_string(args.hf_train_dataset)
     args.hf_train_subset = normalize_optional_string(args.hf_train_subset)
     args.hf_train_split = normalize_optional_string(args.hf_train_split) or "train"
@@ -1693,6 +1838,11 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
             parser.error("--data_source text requires both --train_text and --val_text")
         if args.task != "pretrain":
             parser.error("--data_source text currently only supports --task pretrain")
+    elif args.data_source == "jsonl":
+        if args.task != "sft":
+            parser.error("--data_source jsonl currently only supports --task sft")
+        if args.train_jsonl is None or args.val_jsonl is None:
+            parser.error("--data_source jsonl requires --train_jsonl and --val_jsonl")
     else:
         if args.hf_train_dataset is None:
             parser.error("--data_source huggingface requires --hf_train_dataset")
@@ -1731,6 +1881,8 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
         task=args.task,
         train_text=args.train_text,
         val_text=args.val_text,
+        train_jsonl=args.train_jsonl,
+        val_jsonl=args.val_jsonl,
         hf_train_dataset=args.hf_train_dataset,
         hf_train_subset=args.hf_train_subset,
         hf_train_split=args.hf_train_split,
@@ -1750,6 +1902,8 @@ def parse_args() -> tuple[argparse.Namespace, TrainConfig]:
         sft_train_on_prompt=args.sft_train_on_prompt,
         sft_min_example_tokens=args.sft_min_example_tokens,
         sft_max_example_tokens=(args.sft_max_example_tokens or None),
+        sft_chat_template=args.sft_chat_template,
+        sft_tokenizer_out=args.sft_tokenizer_out,
         hf_cache_dir=args.hf_cache_dir,
         local_storage_budget_gb=args.local_storage_budget_gb,
         vocab_size=args.vocab_size,
@@ -1808,6 +1962,15 @@ def main() -> None:
         tokenizer = load_bpe_tokenizer(train_config.tokenizer)
         tokenizer_path = train_config.tokenizer
 
+    if train_config.task == "sft" and train_config.sft_chat_template == "compact":
+        added_tokens = add_chat_special_tokens(tokenizer)
+        print(f"chat template: compact | added chat tokens: {added_tokens}")
+        if train_config.sft_tokenizer_out is not None:
+            ensure_parent_dir(train_config.sft_tokenizer_out)
+            tokenizer.save(train_config.sft_tokenizer_out)
+            tokenizer_path = train_config.sft_tokenizer_out
+            print(f"saved sft tokenizer: {train_config.sft_tokenizer_out}")
+
     if train_config.export_tokenizer_cbin is not None:
         export_tokenizer_cbin(tokenizer_path, train_config.export_tokenizer_cbin)
         print(f"exported tokenizer cbin: {train_config.export_tokenizer_cbin}")
@@ -1860,6 +2023,15 @@ def main() -> None:
             train_config.batch_size,
             device,
             model_config.pad_id,
+        )
+    elif train_config.data_source == "jsonl":
+        print(f"jsonl train source: {train_config.train_jsonl}")
+        print(f"jsonl val source:   {train_config.val_jsonl}")
+        train_loader, val_loader = build_jsonl_sft_loaders(
+            train_config,
+            tokenizer,
+            model_config,
+            device,
         )
     else:
         print(

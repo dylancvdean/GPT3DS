@@ -1,6 +1,7 @@
 .venv/
 .env
 .cache/
+data/
 
 __pycache__/
 *.py[cod]
@@ -22,6 +23,3 @@ AGENTS.md
 3ds/romfs/model_weights.bin
 3ds/romfs/model_desc.h
 3ds/romfs/tokenizer_qwends.cbin
-
-tokenizer_qwends.json
-tokenizer_qwends.cbin

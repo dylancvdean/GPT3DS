@@ -4,17 +4,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 exec python train.py \
-  --data_source huggingface \
+  --data_source jsonl \
   --task sft \
-  --hf_train_dataset HuggingFaceTB/smoltalk \
-  --hf_train_subset all \
-  --hf_train_split train \
-  --hf_val_dataset HuggingFaceTB/smoltalk \
-  --hf_val_subset all \
-  --hf_val_split test \
+  --train_jsonl data/smoltalk_pair128_train.jsonl \
+  --val_jsonl data/smoltalk_pair128_val.jsonl \
   --hf_conversations_field messages \
-  --hf_no_streaming \
   --tokenizer tokenizer_qwends.json \
+  --sft_chat_template compact \
+  --sft_tokenizer_out tokenizer_qwends_sft.json \
   --init_checkpoint ckpt_fineweb.best.pt \
   --out ckpt_smoltalk_sft.pt \
   --ctx_len 128 \

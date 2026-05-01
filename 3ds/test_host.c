@@ -63,6 +63,10 @@ int main(int argc, char* argv[]) {
     float logits[MODEL_VOCAB_SIZE];
     model.cache_len = 0;
     model_forward(&model, tokens, 1, logits, 1);
+    if (model.cache_len != 1) {
+        printf("FAILED: cache_len after single token = %d\n", model.cache_len);
+        return 1;
+    }
 
     /* Find top 5 logits */
     struct { float val; int idx; } top[5];
@@ -85,6 +89,16 @@ int main(int argc, char* argv[]) {
         tokenizer_decode(tokenizer, single_tok, 1, tok_str, sizeof(tok_str));
         printf("  %d (%.3f): '%s'\n", top[k].idx, top[k].val, tok_str);
     }
+
+    printf("\nChecking cached multi-turn prefill append...\n");
+    int cache_before = model.cache_len;
+    model_forward(&model, tokens + 1, n - 1, logits, 1);
+    if (model.cache_len != cache_before + n - 1) {
+        printf("FAILED: cache_len after append = %d, expected %d\n",
+               model.cache_len, cache_before + n - 1);
+        return 1;
+    }
+    printf("OK.  cache_len=%d\n", model.cache_len);
 
     /* Test a short generation (stochastic) */
     printf("\nGenerating 10 tokens from prompt '%s'...\n", test_text);

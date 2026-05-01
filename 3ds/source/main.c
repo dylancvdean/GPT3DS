@@ -121,8 +121,9 @@ static struct {
     int   cache_len;
     int   last_token_id;
     int   prompt_tokens;
+    int   turn_start_cache_len;
     float tokens_per_sec;
-} dbg = { "Ready", 0, 0, 0, -1, 0, 0.0f };
+} dbg = { "Ready", 0, 0, 0, -1, 0, 0, 0.0f };
 
 /* ── System info ───────────────────────────────────────── */
 static u8  sys_battery_level = 0;   /* 0-5 */
@@ -390,8 +391,9 @@ static void draw_bot_screen(void) {
         dbg.tokens_generated, dbg.max_tokens, dbg.prompt_tokens);
     y += 10;
     dt(16, y, 0.1f, SMALL_SCALE, COL_DBG_KEY, "Cache:");
-    dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d / %d",
-        dbg.cache_len, MODEL_CTX_LEN);
+    dtf(c2, y, 0.1f, SMALL_SCALE, COL_DBG_VAL, "%d / %d  +%d turn",
+        dbg.cache_len, MODEL_CTX_LEN,
+        dbg.cache_len - dbg.turn_start_cache_len);
     y += 12;
 
     /* ── Progress bar (during generation) ──────── */
@@ -468,6 +470,11 @@ static void render_frame(void) {
     draw_bot_screen();
 
     C3D_FrameEnd(0);
+}
+
+static void yield_render_frame(void* user) {
+    (void)user;
+    render_frame();
 }
 
 /* ── Loading / error screens ───────────────────────────── */
@@ -620,6 +627,7 @@ int main(int argc, char* argv[]) {
             dbg.max_tokens = 0;
             dbg.cache_len = 0;
             dbg.prompt_tokens = 0;
+            dbg.turn_start_cache_len = 0;
             dbg.tokens_per_sec = 0.0f;
         }
 
@@ -684,6 +692,7 @@ int main(int argc, char* argv[]) {
                 dbg.status = "Prefilling";
                 dbg.prompt_tokens = n_tokens;
                 dbg.tokens_generated = 0;
+                dbg.turn_start_cache_len = model.cache_len;
                 int ctx_remaining = MODEL_CTX_LEN - model.cache_len - n_tokens;
                 int max_new = (hp_max_tokens > 0 && hp_max_tokens < ctx_remaining)
                             ? hp_max_tokens : ctx_remaining;
@@ -693,7 +702,9 @@ int main(int argc, char* argv[]) {
                 render_frame();
 
                 /* Prefill (cache_len preserved across turns) */
+                model_set_yield_callback(&model, yield_render_frame, NULL);
                 model_forward(&model, tokens, n_tokens, generation_logits, 1);
+                dbg.cache_len = model.cache_len;
                 int next_token = model_sample_logits(generation_logits,
                                                      hp_temperature,
                                                      hp_top_k);
@@ -737,10 +748,13 @@ int main(int argc, char* argv[]) {
                     /* Next token */
                     model_forward(&model, &next_token, 1,
                                   generation_logits, 1);
+                    dbg.cache_len = model.cache_len;
                     next_token = model_sample_logits(generation_logits,
                                                      hp_temperature,
                                                      hp_top_k);
                 }
+                model_set_yield_callback(&model, NULL, NULL);
+                dbg.cache_len = model.cache_len;
 
                 /* Store in history */
                 live_active = 0;

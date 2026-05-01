@@ -40,10 +40,11 @@ TOKENIZER_JSON	?=	$(TOPDIR)/../tokenizer_qwends_sft.json
 PYTHON		?=	$(firstword $(wildcard $(TOPDIR)/../.venv/bin/python) python3)
 
 APP_TITLE	:=	GPT3DS
-APP_DESCRIPTION	:=	Tiny looped transformer
-APP_AUTHOR	:=	GPT3DS Team
-APP_VERSION	:=	0.1.0
+APP_DESCRIPTION	:=	Chat with your n3DS
+APP_AUTHOR	:=	Dylan Dean
+APP_VERSION	:=	0.9.0
 APP_TITLEID	:=	0x000400000FF3FF00
+ICON := icon.png
 
 #---------------------------------------------------------------------------------
 # options for code generation

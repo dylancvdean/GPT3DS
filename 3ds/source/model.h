@@ -32,6 +32,8 @@ typedef struct {
     const float* lm_head_bias;       // [vocab_size]
 } ModelWeights;
 
+typedef void (*ModelYieldCallback)(void* user);
+
 typedef struct {
     ModelWeights weights;
     uint8_t*     weights_buf;        // owned, loaded from ROMFS
@@ -39,10 +41,13 @@ typedef struct {
     float*       kv_k;               // [n_layers, ctx_len, d_model]
     float*       kv_v;               // [n_layers, ctx_len, d_model]
     float*       embed_cache;        // [ctx_len, d_model] token + position embeddings before conv
+    ModelYieldCallback yield_cb;
+    void*        yield_user;
 } ModelCtx;
 
 int  model_load(ModelCtx* ctx, const char* weights_path);
 void model_free(ModelCtx* ctx);
+void model_set_yield_callback(ModelCtx* ctx, ModelYieldCallback cb, void* user);
 
 /*
  * Forward pass.

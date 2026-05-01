@@ -113,6 +113,38 @@ static void attn_prefill(float* out, const float* q, const float* k,
     }
 }
 
+static void attn_prefill_cached(float* out, const float* q,
+                                const float* cache_k, const float* cache_v,
+                                int cache_pos, int T) {
+    float scale = 1.0f / sqrtf((float)MODEL_HEAD_DIM);
+    int D = MODEL_D_MODEL;
+    int H = MODEL_N_HEADS;
+    int HD = MODEL_HEAD_DIM;
+
+    for (int t = 0; t < T; t++) {
+        int total = cache_pos + t + 1;
+        for (int h = 0; h < H; h++) {
+            float scores[MAX_SEQ];
+            const float* q_vec = q + t * D + h * HD;
+            for (int s = 0; s < total; s++) {
+                float dot = 0.0f;
+                const float* k_vec = cache_k + s * D + h * HD;
+                for (int d = 0; d < HD; d++) dot += q_vec[d] * k_vec[d];
+                scores[s] = dot * scale;
+            }
+            softmax_inplace(scores, total);
+
+            float* o_vec = out + t * D + h * HD;
+            for (int d = 0; d < HD; d++) o_vec[d] = 0.0f;
+            for (int s = 0; s < total; s++) {
+                const float* v_vec = cache_v + s * D + h * HD;
+                float sc = scores[s];
+                for (int d = 0; d < HD; d++) o_vec[d] += sc * v_vec[d];
+            }
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Causal self-attention (single token with KV cache)                 */
 static void attn_generate(float* out, const float* q,
@@ -143,6 +175,10 @@ static void attn_generate(float* out, const float* q,
             for (int d = 0; d < HD; d++) o_vec[d] += sc * v_vec[d];
         }
     }
+}
+
+static void model_maybe_yield(ModelCtx* ctx) {
+    if (ctx && ctx->yield_cb) ctx->yield_cb(ctx->yield_user);
 }
 
 /* ------------------------------------------------------------------ */
@@ -257,6 +293,8 @@ int model_load(ModelCtx* ctx, const char* weights_path) {
         return -1;
     }
     ctx->cache_len = 0;
+    ctx->yield_cb = NULL;
+    ctx->yield_user = NULL;
     return 0;
 }
 
@@ -269,6 +307,14 @@ void model_free(ModelCtx* ctx) {
     ctx->kv_v = NULL;
     ctx->embed_cache = NULL;
     ctx->weights_buf = NULL;
+    ctx->yield_cb = NULL;
+    ctx->yield_user = NULL;
+}
+
+void model_set_yield_callback(ModelCtx* ctx, ModelYieldCallback cb, void* user) {
+    if (!ctx) return;
+    ctx->yield_cb = cb;
+    ctx->yield_user = user;
 }
 
 /* ------------------------------------------------------------------ */
@@ -346,9 +392,11 @@ void model_forward(ModelCtx* ctx, const int* tokens, int n_tokens,
                 }
             } else {
                 /* prefill: store all T positions */
-                if (T <= MODEL_CTX_LEN) {
-                    memcpy(cache_k, buf_k, T * D * sizeof(float));
-                    memcpy(cache_v, buf_v, T * D * sizeof(float));
+                if (cache_pos + T <= MODEL_CTX_LEN) {
+                    memcpy(cache_k + cache_pos * D, buf_k,
+                           T * D * sizeof(float));
+                    memcpy(cache_v + cache_pos * D, buf_v,
+                           T * D * sizeof(float));
                 }
             }
         }
@@ -358,6 +406,11 @@ void model_forward(ModelCtx* ctx, const int* tokens, int n_tokens,
             float* cache_k = ctx->kv_k + l * MODEL_CTX_LEN * D;
             float* cache_v = ctx->kv_v + l * MODEL_CTX_LEN * D;
             attn_generate(buf_attn, buf_q, cache_k, cache_v, cache_pos);
+        } else if (use_cache) {
+            float* cache_k = ctx->kv_k + l * MODEL_CTX_LEN * D;
+            float* cache_v = ctx->kv_v + l * MODEL_CTX_LEN * D;
+            attn_prefill_cached(buf_attn, buf_q, cache_k, cache_v,
+                                cache_pos, T);
         } else {
             attn_prefill(buf_attn, buf_q, buf_k, buf_v, T);
         }
@@ -392,12 +445,12 @@ void model_forward(ModelCtx* ctx, const int* tokens, int n_tokens,
 
         /* residual */
         for (int i = 0; i < T * D; i++) buf_x[i] += buf_norm[i];
+
+        model_maybe_yield(ctx);
     }
 
-    if (use_cache && T > 1) {
-        ctx->cache_len = T;
-    } else if (use_cache && T == 1) {
-        ctx->cache_len++;
+    if (use_cache) {
+        ctx->cache_len += T;
     }
 
     /* ---- final norm & logits ---- */

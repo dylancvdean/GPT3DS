@@ -58,6 +58,7 @@
 #define MAX_PROMPT_LEN   256
 #define MAX_RESPONSE_LEN 1024
 #define MAX_HISTORY      16
+#define GEN_YIELD_INTERVAL_MS 120
 
 /* SFT chat-template special token IDs (added_tokens in tokenizer_qwends_sft.json,
  * not present in the BPE vocab — injected directly by id). */
@@ -78,6 +79,7 @@ static float generation_logits[MODEL_VOCAB_SIZE];
 static char live_user[MAX_PROMPT_LEN];
 static char live_bot[MAX_RESPONSE_LEN];
 static int  live_active = 0;
+static u64  gen_last_yield_ms = 0;
 
 /* Manual scroll offset (0 = pinned to bottom, positive = scrolled up) */
 static float chat_scroll_off = 0.0f;
@@ -89,7 +91,7 @@ static float chat_scroll_off = 0.0f;
 #define HP_MAXTOK 2
 
 static int   hp_sel = 0;           /* currently selected param */
-static float hp_temperature = 0.9f;
+static float hp_temperature = 0.7f;
 static int   hp_top_k = 40;
 static int   hp_max_tokens = 0;    /* 0 = use all remaining context */
 
@@ -474,6 +476,9 @@ static void render_frame(void) {
 
 static void yield_render_frame(void* user) {
     (void)user;
+    u64 now = osGetTime();
+    if (now - gen_last_yield_ms < GEN_YIELD_INTERVAL_MS) return;
+    gen_last_yield_ms = now;
     render_frame();
 }
 
@@ -526,6 +531,13 @@ static void show_error_and_wait(const char* msg) {
 static void copy_text(char* dst, size_t dst_size, const char* src) {
     if (dst_size == 0) return;
     snprintf(dst, dst_size, "%s", src);
+}
+
+static void append_text(char* dst, size_t dst_size, const char* src) {
+    if (dst_size == 0) return;
+    size_t len = strlen(dst);
+    if (len >= dst_size - 1) return;
+    snprintf(dst + len, dst_size - len, "%s", src);
 }
 
 /* ── Main ──────────────────────────────────────────────── */
@@ -699,6 +711,7 @@ int main(int argc, char* argv[]) {
                 dbg.max_tokens = max_new;
                 dbg.cache_len = model.cache_len;
                 dbg.tokens_per_sec = 0.0f;
+                gen_last_yield_ms = osGetTime();
                 render_frame();
 
                 /* Prefill (cache_len preserved across turns) */
@@ -710,10 +723,10 @@ int main(int argc, char* argv[]) {
                                                      hp_top_k);
 
                 /* Token-by-token generation */
-                int out_tokens[MODEL_CTX_LEN];
                 int n_out = 0;
                 int eos_id = tokenizer_eos_id(tokenizer);
                 char response[MAX_RESPONSE_LEN];
+                char piece[128];
                 response[0] = '\0';
 
                 dbg.status = "Generating";
@@ -722,9 +735,10 @@ int main(int argc, char* argv[]) {
                 for (int i = 0; i < max_new; i++) {
                     if (eos_id >= 0 && next_token == eos_id) break;
 
-                    out_tokens[n_out++] = next_token;
-                    tokenizer_decode(tokenizer, out_tokens, n_out,
-                                     response, sizeof(response));
+                    n_out++;
+                    tokenizer_decode(tokenizer, &next_token, 1,
+                                     piece, sizeof(piece));
+                    append_text(response, sizeof(response), piece);
 
                     /* Update live display */
                     copy_text(live_bot, sizeof(live_bot), response);
@@ -738,7 +752,13 @@ int main(int argc, char* argv[]) {
                         dbg.tokens_per_sec = (float)n_out
                                            / ((float)elapsed / 1000.0f);
 
-                    render_frame();
+                    {
+                        u64 now = osGetTime();
+                        if (now - gen_last_yield_ms >= GEN_YIELD_INTERVAL_MS) {
+                            gen_last_yield_ms = now;
+                            render_frame();
+                        }
+                    }
 
                     /* Check for early stop */
                     hidScanInput();
@@ -755,6 +775,7 @@ int main(int argc, char* argv[]) {
                 }
                 model_set_yield_callback(&model, NULL, NULL);
                 dbg.cache_len = model.cache_len;
+                render_frame();
 
                 /* Store in history */
                 live_active = 0;

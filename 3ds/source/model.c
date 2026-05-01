@@ -181,6 +181,48 @@ static void model_maybe_yield(ModelCtx* ctx) {
     if (ctx && ctx->yield_cb) ctx->yield_cb(ctx->yield_user);
 }
 
+static int build_lm_head_q8(ModelCtx* ctx) {
+    size_t n_weights = (size_t)MODEL_VOCAB_SIZE * MODEL_D_MODEL;
+    ctx->lm_head_w_q8 = (int8_t*)malloc(n_weights);
+    ctx->lm_head_s = (float*)malloc((size_t)MODEL_VOCAB_SIZE * sizeof(float));
+    if (!ctx->lm_head_w_q8 || !ctx->lm_head_s) {
+        free(ctx->lm_head_w_q8);
+        free(ctx->lm_head_s);
+        ctx->lm_head_w_q8 = NULL;
+        ctx->lm_head_s = NULL;
+        return -1;
+    }
+
+    for (int i = 0; i < MODEL_VOCAB_SIZE; i++) {
+        const uint16_t* src = ctx->weights.token_emb + i * MODEL_D_MODEL;
+        int8_t* dst = ctx->lm_head_w_q8 + i * MODEL_D_MODEL;
+        float max_abs = 0.0f;
+
+        for (int d = 0; d < MODEL_D_MODEL; d++) {
+            float a = fabsf(fp16_to_f32(src[d]));
+            if (a > max_abs) max_abs = a;
+        }
+
+        if (max_abs <= 1e-12f) {
+            ctx->lm_head_s[i] = 1.0f;
+            memset(dst, 0, MODEL_D_MODEL);
+            continue;
+        }
+
+        float inv_scale = 127.0f / max_abs;
+        ctx->lm_head_s[i] = max_abs / 127.0f;
+        for (int d = 0; d < MODEL_D_MODEL; d++) {
+            float x = fp16_to_f32(src[d]) * inv_scale;
+            int q = (int)(x + (x >= 0.0f ? 0.5f : -0.5f));
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            dst[d] = (int8_t)q;
+        }
+    }
+
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Model loading                                                      */
 static uint8_t* load_file(const char* path, size_t* out_size) {
@@ -275,6 +317,14 @@ int model_load(ModelCtx* ctx, const char* weights_path) {
     ctx->weights.lm_head_bias = PTR(OFF_LM_HEAD_BIAS, float);
 #undef PTR
 
+    ctx->lm_head_w_q8 = NULL;
+    ctx->lm_head_s = NULL;
+    if (build_lm_head_q8(ctx) != 0) {
+        free(base);
+        ctx->weights_buf = NULL;
+        return -1;
+    }
+
     /* Allocate KV cache */
     size_t kv_size = (size_t)MODEL_N_LAYERS * MODEL_CTX_LEN * MODEL_D_MODEL * sizeof(float);
     size_t embed_size = (size_t)MODEL_CTX_LEN * MODEL_D_MODEL * sizeof(float);
@@ -285,10 +335,14 @@ int model_load(ModelCtx* ctx, const char* weights_path) {
         free(ctx->kv_k);
         free(ctx->kv_v);
         free(ctx->embed_cache);
+        free(ctx->lm_head_w_q8);
+        free(ctx->lm_head_s);
         free(base);
         ctx->kv_k = NULL;
         ctx->kv_v = NULL;
         ctx->embed_cache = NULL;
+        ctx->lm_head_w_q8 = NULL;
+        ctx->lm_head_s = NULL;
         ctx->weights_buf = NULL;
         return -1;
     }
@@ -302,10 +356,14 @@ void model_free(ModelCtx* ctx) {
     free(ctx->kv_k);
     free(ctx->kv_v);
     free(ctx->embed_cache);
+    free(ctx->lm_head_w_q8);
+    free(ctx->lm_head_s);
     free(ctx->weights_buf);
     ctx->kv_k = NULL;
     ctx->kv_v = NULL;
     ctx->embed_cache = NULL;
+    ctx->lm_head_w_q8 = NULL;
+    ctx->lm_head_s = NULL;
     ctx->weights_buf = NULL;
     ctx->yield_cb = NULL;
     ctx->yield_user = NULL;
@@ -457,8 +515,9 @@ void model_forward(ModelCtx* ctx, const int* tokens, int n_tokens,
     float* last_x = buf_x + (T - 1) * D;
     rmsnorm(buf_norm, last_x, ctx->weights.final_norm_w, D);
 
-    /* tied head: matmul with transposed token_emb (fp16) + bias */
-    matmul_fp16_fp32(MODEL_VOCAB_SIZE, D, ctx->weights.token_emb, buf_norm, logits);
+    /* tied head: cached int8 copy of token_emb + bias */
+    matmul_q8_fp32(MODEL_VOCAB_SIZE, D, ctx->lm_head_w_q8, ctx->lm_head_s,
+                   buf_norm, logits);
     for (int i = 0; i < MODEL_VOCAB_SIZE; i++) {
         logits[i] += ctx->weights.lm_head_bias[i];
     }

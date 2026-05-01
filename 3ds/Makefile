@@ -46,6 +46,12 @@ APP_VERSION	:=	0.9.0
 APP_TITLEID	:=	0x000400000FF3FF00
 ICON := icon.png
 
+APP_VERSION_PARTS	:=	$(subst ., ,$(APP_VERSION))
+APP_VERSION_MAJOR	:=	$(or $(word 1,$(APP_VERSION_PARTS)),0)
+APP_VERSION_MINOR	:=	$(or $(word 2,$(APP_VERSION_PARTS)),0)
+APP_VERSION_MICRO	:=	$(or $(word 3,$(APP_VERSION_PARTS)),0)
+APP_TITLE_VERSION	?=	$(shell echo $$(( ($(APP_VERSION_MAJOR) << 10) | ($(APP_VERSION_MINOR) << 4) | $(APP_VERSION_MICRO) )))
+
 #---------------------------------------------------------------------------------
 # options for code generation
 #---------------------------------------------------------------------------------
@@ -175,7 +181,7 @@ $(OUTPUT).3dsx	:	$(OUTPUT).elf $(_3DSXDEPS)
 
 $(OUTPUT).cia	:	$(OUTPUT).elf $(OUTPUT).smdh $(TOPDIR)/app.rsf $(shell find $(TOPDIR)/$(ROMFS) -type f)
 	@command -v $(MAKEROM) >/dev/null 2>&1 || { echo "makerom not found. Install MakeROM or run make MAKEROM=/path/to/makerom"; exit 1; }
-	$(SILENTCMD)$(MAKEROM) -f cia -target t -o $@ -elf $(OUTPUT).elf -icon $(OUTPUT).smdh -rsf $(TOPDIR)/app.rsf -desc app:4 -ver 0 -DROMFS_ROOT=$(TOPDIR)/$(ROMFS)
+	$(SILENTCMD)$(MAKEROM) -f cia -target t -o $@ -elf $(OUTPUT).elf -icon $(OUTPUT).smdh -rsf $(TOPDIR)/app.rsf -desc app:4 -ver $(APP_TITLE_VERSION) -DROMFS_ROOT=$(TOPDIR)/$(ROMFS)
 	$(SILENTMSG) built ... $(notdir $@)
 
 $(OUTPUT).elf	:	$(OFILES)

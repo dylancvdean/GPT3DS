@@ -31,6 +31,20 @@ static void build_bytelevel_maps(uint32_t* b2u, uint8_t* u2b, int u2b_size) {
     }
 }
 
+static void get_bytelevel_maps(const uint32_t** b2u, const uint8_t** u2b) {
+    static uint32_t b2u_cache[256];
+    static uint8_t  u2b_cache[512];
+    static int ready = 0;
+
+    if (!ready) {
+        build_bytelevel_maps(b2u_cache, u2b_cache, sizeof(u2b_cache));
+        ready = 1;
+    }
+
+    if (b2u) *b2u = b2u_cache;
+    if (u2b) *u2b = u2b_cache;
+}
+
 /* ------------------------------------------------------------------ */
 /* UTF-8 helpers                                                      */
 
@@ -285,9 +299,8 @@ int tokenizer_encode(Tokenizer* t, const char* text,
                      int* tokens, int max_tokens, int add_bos) {
     if (!t || !text || max_tokens <= 0) return 0;
 
-    uint32_t b2u[256];
-    uint8_t  u2b[512];
-    build_bytelevel_maps(b2u, u2b, sizeof(u2b));
+    const uint32_t* b2u;
+    get_bytelevel_maps(&b2u, NULL);
 
     int init[512];
     int n = 0;
@@ -336,9 +349,8 @@ int tokenizer_decode(Tokenizer* t, const int* tokens, int n_tokens,
                      char* out, int out_size) {
     if (!t || !out || out_size <= 0) return 0;
 
-    uint32_t b2u[256];
-    uint8_t  u2b[512];
-    build_bytelevel_maps(b2u, u2b, sizeof(u2b));
+    const uint8_t* u2b;
+    get_bytelevel_maps(NULL, &u2b);
 
     int pos = 0;
     for (int i = 0; i < n_tokens; i++) {

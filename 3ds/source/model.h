@@ -41,6 +41,8 @@ typedef struct {
     float*       kv_k;               // [n_layers, ctx_len, d_model]
     float*       kv_v;               // [n_layers, ctx_len, d_model]
     float*       embed_cache;        // [ctx_len, d_model] token + position embeddings before conv
+    int8_t*      lm_head_w_q8;       // [vocab_size, d_model] int8 copy of token_emb
+    float*       lm_head_s;          // [vocab_size]
     ModelYieldCallback yield_cb;
     void*        yield_user;
 } ModelCtx;

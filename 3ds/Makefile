@@ -38,11 +38,12 @@ MAKEROM		?=	$(firstword $(wildcard $(DEVKITPRO)/tools/bin/makerom tools/makerom 
 CHECKPOINT	?=	$(TOPDIR)/../ckpt_smoltalk_sft.best.pt
 TOKENIZER_JSON	?=	$(TOPDIR)/../tokenizer_qwends_sft.json
 PYTHON		?=	$(firstword $(wildcard $(TOPDIR)/../.venv/bin/python) python3)
+DSP_DOT		?=	1
 
 APP_TITLE	:=	GPT3DS
 APP_DESCRIPTION	:=	Chat with your n3DS
 APP_AUTHOR	:=	Dylan Dean
-APP_VERSION	:=	0.9.2
+APP_VERSION	:=	1.0.0
 APP_TITLEID	:=	0x000400000FF3FF00
 ICON := icon.png
 
@@ -62,6 +63,9 @@ CFLAGS	:=	-g -Wall -O3 -mword-relocations \
 			$(ARCH)
 
 CFLAGS	+=	$(INCLUDE) -D__3DS__
+ifeq ($(DSP_DOT),0)
+CFLAGS	+=	-DGPT3DS_NO_ARM_DSP_DOT
+endif
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 

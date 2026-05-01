@@ -4,6 +4,11 @@
 
 #ifdef __3DS__
 #include <3ds.h>
+#include <arm_acle.h>
+#endif
+
+#if defined(__3DS__) && defined(__ARM_FEATURE_SIMD32) && !defined(GPT3DS_NO_ARM_DSP_DOT)
+#define GPT3DS_ARM_DSP_DOT 1
 #endif
 
 static void matmul_q8_fp32_exact(int M, int K, const int8_t* weight,
@@ -48,8 +53,8 @@ static int quantize_input_q8(int K, const float* input,
     return 0;
 }
 
-static inline int32_t dot_q8_row(const int8_t* w_row,
-                                 const int8_t* input_q, int K) {
+static inline int32_t dot_q8_row_scalar(const int8_t* w_row,
+                                        const int8_t* input_q, int K) {
     int32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
     int j = 0;
     for (; j + 15 < K; j += 16) {
@@ -75,6 +80,71 @@ static inline int32_t dot_q8_row(const int8_t* w_row,
         sum += (int32_t)w_row[j] * input_q[j];
     }
     return sum;
+}
+
+#ifdef GPT3DS_ARM_DSP_DOT
+static inline uint32_t load_u32_aligned(const void* p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static inline uint32_t ror8_u32(uint32_t x) {
+    return (x >> 8) | (x << 24);
+}
+
+static inline int32_t dot_q8_row_dsp(const int8_t* w_row,
+                                     const int8_t* input_q, int K) {
+    int32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    int j = 0;
+
+    for (; j + 15 < K; j += 16) {
+        uint32_t w0 = load_u32_aligned(w_row + j);
+        uint32_t x0 = load_u32_aligned(input_q + j);
+        uint32_t w1 = load_u32_aligned(w_row + j + 4);
+        uint32_t x1 = load_u32_aligned(input_q + j + 4);
+        uint32_t w2 = load_u32_aligned(w_row + j + 8);
+        uint32_t x2 = load_u32_aligned(input_q + j + 8);
+        uint32_t w3 = load_u32_aligned(w_row + j + 12);
+        uint32_t x3 = load_u32_aligned(input_q + j + 12);
+
+        s0 = __smlad(__sxtb16((int8x4_t)w0),
+                     __sxtb16((int8x4_t)x0), s0);
+        s0 = __smlad(__sxtb16((int8x4_t)ror8_u32(w0)),
+                     __sxtb16((int8x4_t)ror8_u32(x0)), s0);
+
+        s1 = __smlad(__sxtb16((int8x4_t)w1),
+                     __sxtb16((int8x4_t)x1), s1);
+        s1 = __smlad(__sxtb16((int8x4_t)ror8_u32(w1)),
+                     __sxtb16((int8x4_t)ror8_u32(x1)), s1);
+
+        s2 = __smlad(__sxtb16((int8x4_t)w2),
+                     __sxtb16((int8x4_t)x2), s2);
+        s2 = __smlad(__sxtb16((int8x4_t)ror8_u32(w2)),
+                     __sxtb16((int8x4_t)ror8_u32(x2)), s2);
+
+        s3 = __smlad(__sxtb16((int8x4_t)w3),
+                     __sxtb16((int8x4_t)x3), s3);
+        s3 = __smlad(__sxtb16((int8x4_t)ror8_u32(w3)),
+                     __sxtb16((int8x4_t)ror8_u32(x3)), s3);
+    }
+
+    int32_t sum = s0 + s1 + s2 + s3;
+    for (; j < K; j++) {
+        sum += (int32_t)w_row[j] * input_q[j];
+    }
+    return sum;
+}
+#endif
+
+static inline int32_t dot_q8_row(const int8_t* w_row,
+                                 const int8_t* input_q, int K) {
+#ifdef GPT3DS_ARM_DSP_DOT
+    if ((((uintptr_t)w_row | (uintptr_t)input_q | (uintptr_t)K) & 3u) == 0) {
+        return dot_q8_row_dsp(w_row, input_q, K);
+    }
+#endif
+    return dot_q8_row_scalar(w_row, input_q, K);
 }
 
 typedef struct {

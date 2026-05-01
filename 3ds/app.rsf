@@ -30,9 +30,9 @@ AccessControlInfo:
   MemoryType              : Application
   SystemMode              : 64MB
   IdealProcessor          : 0
-  AffinityMask            : 1
+  AffinityMask            : 5
   Priority                : 16
-  MaxCpu                  : 0
+  MaxCpu                  : 2
   HandleTableSize         : 0x200
   DisableDebug            : false
   EnableForceDebug        : false

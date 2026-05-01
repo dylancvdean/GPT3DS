@@ -34,6 +34,14 @@ static inline float fp16_to_f32(uint16_t h) {
 void matmul_q8_fp32(int M, int K, const int8_t* weight, const float* scales,
                     const float* input, float* output);
 
+void matmul_q8_fp32_fused3(int M, int K,
+                           const int8_t* weight0, const float* scales0, float* output0,
+                           const int8_t* weight1, const float* scales1, float* output1,
+                           const int8_t* weight2, const float* scales2, float* output2,
+                           const float* input);
+
+void matmul_shutdown_workers(void);
+
 void matmul_fp16_fp32(int M, int K, const uint16_t* weight,
                       const float* input, float* output);
 

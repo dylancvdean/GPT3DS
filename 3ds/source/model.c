@@ -353,6 +353,7 @@ int model_load(ModelCtx* ctx, const char* weights_path) {
 }
 
 void model_free(ModelCtx* ctx) {
+    matmul_shutdown_workers();
     free(ctx->kv_k);
     free(ctx->kv_v);
     free(ctx->embed_cache);
@@ -433,9 +434,11 @@ void model_forward(ModelCtx* ctx, const int* tokens, int n_tokens,
 
         /* QKV projections */
         for (int t = 0; t < T; t++) {
-            matmul_q8_fp32(D, D, blk->q_w, blk->q_s, buf_norm + t * D, buf_q + t * D);
-            matmul_q8_fp32(D, D, blk->k_w, blk->k_s, buf_norm + t * D, buf_k + t * D);
-            matmul_q8_fp32(D, D, blk->v_w, blk->v_s, buf_norm + t * D, buf_v + t * D);
+            matmul_q8_fp32_fused3(D, D,
+                                  blk->q_w, blk->q_s, buf_q + t * D,
+                                  blk->k_w, blk->k_s, buf_k + t * D,
+                                  blk->v_w, blk->v_s, buf_v + t * D,
+                                  buf_norm + t * D);
         }
 
         /* KV cache handling */

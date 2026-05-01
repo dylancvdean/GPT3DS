@@ -42,7 +42,7 @@ PYTHON		?=	$(firstword $(wildcard $(TOPDIR)/../.venv/bin/python) python3)
 APP_TITLE	:=	GPT3DS
 APP_DESCRIPTION	:=	Chat with your n3DS
 APP_AUTHOR	:=	Dylan Dean
-APP_VERSION	:=	0.9.0
+APP_VERSION	:=	0.9.2
 APP_TITLEID	:=	0x000400000FF3FF00
 ICON := icon.png
 

@@ -12,6 +12,12 @@ generation directly on the handheld.
 This is mostly an experiment in fitting a real chat-ish language model into the
 New 3DS memory and CPU budget. It's a toy model and seems to only know 3 jokes, but it works.
 
+## Download
+
+[![QR code for GPT3DS v1.0.0 CIA download](assets/gpt3ds-v1.0.0-cia-qr.svg)](https://github.com/dylancvdean/GPT3DS/releases/download/v1.0.0/GPT3DS.cia)
+
+[Download GPT3DS.cia v1.0.0](https://github.com/dylancvdean/GPT3DS/releases/download/v1.0.0/GPT3DS.cia)
+
 ## Project layout
 
 - `train.py` - PyTorch pretraining/SFT script for the looped transformer

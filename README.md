@@ -50,7 +50,6 @@ file.
 - Embeddings are stored as fp16 and converted to fp32 in software
 - Biases, norm weights, KV cache, activations, and logits use fp32
 - Expected memory use is around 25 MB on device
-- Inference is currently single-threaded
 
 ## Building the 3DS app
 
